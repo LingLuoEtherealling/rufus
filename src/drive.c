@@ -29,8 +29,8 @@
 #include <assert.h>
 #if !defined(__MINGW32__)
 #include <initguid.h>
-#endif
 #include <vds.h>
+#endif
 
 #include "rufus.h"
 #include "missing.h"
@@ -1079,6 +1079,7 @@ int GetDriveNumber(HANDLE hDrive, char* path)
 	}
 	if (r >= MAX_DRIVES) {
 		uprintf("Device Number for device %s is too big (%d) - ignoring device", path, r);
+		uprintf("NOTE: This may be due to an excess of Virtual Drives, such as hidden ones created by the XBox PC app");
 		return -1;
 	}
 	return r;
@@ -1487,6 +1488,43 @@ BOOL AnalyzePBR(HANDLE hLogicalVolume)
 	return TRUE;
 }
 
+/*
+ * This call returns the offset of the first ESP partition found
+ * on the relevant drive, or 0ULL if no ESP was found.
+ */
+uint64_t GetEspOffset(DWORD DriveIndex)
+{
+	uint64_t ret = 0ULL;
+	BOOL r;
+	HANDLE hPhysical;
+	DWORD size, i;
+	BYTE layout[4096] = { 0 };
+	PDRIVE_LAYOUT_INFORMATION_EX DriveLayout = (PDRIVE_LAYOUT_INFORMATION_EX)(void*)layout;
+
+	hPhysical = GetPhysicalHandle(DriveIndex, FALSE, TRUE, TRUE);
+	if (hPhysical == INVALID_HANDLE_VALUE)
+		return FALSE;
+
+	r = DeviceIoControl(hPhysical, IOCTL_DISK_GET_DRIVE_LAYOUT_EX,
+		NULL, 0, layout, sizeof(layout), &size, NULL);
+	if (!r || size <= 0) {
+		uprintf("Could not get layout for drive 0x%02x: %s", DriveIndex, WindowsErrorString());
+		goto out;
+	}
+
+	for (i = 0; i < DriveLayout->PartitionCount; i++) {
+		if (((DriveLayout->PartitionStyle == PARTITION_STYLE_MBR) && (DriveLayout->PartitionEntry[i].Mbr.PartitionType == 0xef)) ||
+			((DriveLayout->PartitionStyle == PARTITION_STYLE_GPT) && CompareGUID(&DriveLayout->PartitionEntry[i].Gpt.PartitionType, &PARTITION_GENERIC_ESP))) {
+			ret = DriveLayout->PartitionEntry[i].StartingOffset.QuadPart;
+			break;
+		}
+	}
+
+out:
+	safe_closehandle(hPhysical);
+	return ret;
+}
+
 static BOOL StoreEspInfo(GUID* guid)
 {
 	uint8_t j;
@@ -1531,12 +1569,23 @@ static BOOL ClearEspInfo(uint8_t index)
 BOOL ToggleEsp(DWORD DriveIndex, uint64_t PartitionOffset)
 {
 	char *volume_name, mount_point[] = DEFAULT_ESP_MOUNT_POINT;
-	BOOL r, ret = FALSE, found = FALSE;
+	int i, j, esp_index = -1;
+	BOOL r, ret = FALSE, delete_data = FALSE;
 	HANDLE hPhysical;
-	DWORD size, i, j, esp_index = 0;
-	BYTE layout[4096] = { 0 };
-	GUID* guid;
+	DWORD dl_size, size, offset;
+	BYTE layout[4096] = { 0 }, buf[512];
+	GUID *guid = NULL, *stored_guid = NULL, mbr_guid;
 	PDRIVE_LAYOUT_INFORMATION_EX DriveLayout = (PDRIVE_LAYOUT_INFORMATION_EX)(void*)layout;
+	typedef struct {
+		const uint8_t mbr_type;
+		const uint8_t magic[8];
+	} fat_mbr_type;
+	const fat_mbr_type fat_mbr_types[] = {
+		{ 0x0b, { 'F', 'A', 'T', ' ', ' ', ' ', ' ', ' ' } },
+		{ 0x01, { 'F', 'A', 'T', '1', '2', ' ', ' ', ' ' } },
+		{ 0x0e, { 'F', 'A', 'T', '1', '6', ' ', ' ', ' ' } },
+		{ 0x0c, { 'F', 'A', 'T', '3', '2', ' ', ' ', ' ' } },
+	};
 
 	if ((PartitionOffset == 0) && (nWindowsVersion < WINDOWS_10)) {
 		uprintf("ESP toggling is only available for Windows 10 or later");
@@ -1547,86 +1596,113 @@ BOOL ToggleEsp(DWORD DriveIndex, uint64_t PartitionOffset)
 	if (hPhysical == INVALID_HANDLE_VALUE)
 		return FALSE;
 
-	r = DeviceIoControl(hPhysical, IOCTL_DISK_GET_DRIVE_LAYOUT_EX,
-		NULL, 0, layout, sizeof(layout), &size, NULL);
-	if (!r || size <= 0) {
+	r = DeviceIoControl(hPhysical, IOCTL_DISK_GET_DRIVE_LAYOUT_EX, NULL, 0, layout, sizeof(layout), &dl_size, NULL);
+	if (!r || dl_size <= 0) {
 		uprintf("Could not get layout for drive 0x%02x: %s", DriveIndex, WindowsErrorString());
-		goto out;
-	}
-	// TODO: Handle MBR
-	if (DriveLayout->PartitionStyle != PARTITION_STYLE_GPT) {
-		uprintf("ESP toggling is only available for GPT drives");
 		goto out;
 	}
 
 	if (PartitionOffset == 0) {
 		// See if the current drive contains an ESP
-		for (i = 0, j = 0; i < DriveLayout->PartitionCount; i++) {
-			if (CompareGUID(&DriveLayout->PartitionEntry[i].Gpt.PartitionType, &PARTITION_GENERIC_ESP)) {
+		for (i = 0; i < (int)DriveLayout->PartitionCount; i++) {
+			if (((DriveLayout->PartitionStyle == PARTITION_STYLE_MBR) && (DriveLayout->PartitionEntry[i].Mbr.PartitionType == 0xef)) ||
+				((DriveLayout->PartitionStyle == PARTITION_STYLE_GPT) && CompareGUID(&DriveLayout->PartitionEntry[i].Gpt.PartitionType, &PARTITION_GENERIC_ESP))) {
 				esp_index = i;
-				j++;
+				break;
 			}
 		}
 
-		if (j > 1) {
-			uprintf("ESP toggling is not available for drives with more than one ESP");
-			goto out;
-		}
-		if (j == 1) {
+		if (esp_index >= 0) {
 			// ESP -> Basic Data
-			i = esp_index;
-			uprintf("ESP name: '%S'", DriveLayout->PartitionEntry[i].Gpt.Name);
-			if (!StoreEspInfo(&DriveLayout->PartitionEntry[i].Gpt.PartitionId)) {
+			if (DriveLayout->PartitionStyle == PARTITION_STYLE_GPT) {
+				uprintf("ESP name: '%S'", DriveLayout->PartitionEntry[esp_index].Gpt.Name);
+				guid = &DriveLayout->PartitionEntry[esp_index].Gpt.PartitionId;
+			} else {
+				// For MBR we create a GUID from the disk signature and the offset
+				mbr_guid.Data1 = DriveLayout->Mbr.Signature;
+				mbr_guid.Data2 = 0; mbr_guid.Data3 = 0;
+				*((uint64_t*)&mbr_guid.Data4) = DriveLayout->PartitionEntry[i].StartingOffset.QuadPart;
+				guid = &mbr_guid;
+			}
+			if (!StoreEspInfo(guid)) {
 				uprintf("ESP toggling data could not be stored");
 				goto out;
 			}
-			DriveLayout->PartitionEntry[i].Gpt.PartitionType = PARTITION_MICROSOFT_DATA;
-		} else {
-			// Basic Data -> ESP
-			for (j = 1; j <= MAX_ESP_TOGGLE; j++) {
-				guid = GetEspGuid((uint8_t)j);
-				if (guid != NULL) {
-					for (i = 0; i < DriveLayout->PartitionCount; i++) {
-						if (CompareGUID(guid, &DriveLayout->PartitionEntry[i].Gpt.PartitionId)) {
-							found = TRUE;
-							break;
+			if (DriveLayout->PartitionStyle == PARTITION_STYLE_GPT) {
+				DriveLayout->PartitionEntry[esp_index].Gpt.PartitionType = PARTITION_MICROSOFT_DATA;
+			} else if (DriveLayout->PartitionStyle == PARTITION_STYLE_MBR) {
+				// Default to FAT32 (non LBA) if we can't determine anything better
+				DriveLayout->PartitionEntry[esp_index].Mbr.PartitionType = 0x0b;
+				// Now detect if we're dealing with FAT12/16/32
+				if (SetFilePointerEx(hPhysical, DriveLayout->PartitionEntry[esp_index].StartingOffset, NULL, FILE_BEGIN) &&
+					ReadFile(hPhysical, buf, 512, &size, NULL) && size == 512) {
+					for (offset = 0x36; offset <= 0x52; offset += 0x1c) {
+						for (i = 0; i < ARRAYSIZE(fat_mbr_types); i++) {
+							if (memcmp(&buf[offset], fat_mbr_types[i].magic, 8) == 0) {
+								DriveLayout->PartitionEntry[esp_index].Mbr.PartitionType = fat_mbr_types[i].mbr_type;
+								break;
+							}
 						}
 					}
-					if (found)
-						break;
 				}
 			}
-			if (j > MAX_ESP_TOGGLE)
-				goto out;
-			DriveLayout->PartitionEntry[i].Gpt.PartitionType = PARTITION_GENERIC_ESP;
+		} else {
+			// Basic Data -> ESP
+			for (i = 1; i <= MAX_ESP_TOGGLE && esp_index < 0; i++) {
+				stored_guid = GetEspGuid((uint8_t)i);
+				if (stored_guid != NULL) {
+					for (j = 0; j < (int)DriveLayout->PartitionCount && esp_index < 0; j++) {
+						if (DriveLayout->PartitionStyle == PARTITION_STYLE_GPT) {
+							guid = &DriveLayout->PartitionEntry[j].Gpt.PartitionId;
+						} else if (DriveLayout->PartitionStyle == PARTITION_STYLE_MBR) {
+							mbr_guid.Data1 = DriveLayout->Mbr.Signature;
+							mbr_guid.Data2 = 0; mbr_guid.Data3 = 0;
+							*((uint64_t*)&mbr_guid.Data4) = DriveLayout->PartitionEntry[j].StartingOffset.QuadPart;
+							guid = &mbr_guid;
+						}
+						if (CompareGUID(stored_guid, guid)) {
+							esp_index = j;
+							delete_data = TRUE;
+							if (DriveLayout->PartitionStyle == PARTITION_STYLE_GPT)
+								DriveLayout->PartitionEntry[esp_index].Gpt.PartitionType = PARTITION_GENERIC_ESP;
+							else if (DriveLayout->PartitionStyle == PARTITION_STYLE_MBR)
+								DriveLayout->PartitionEntry[esp_index].Mbr.PartitionType = 0xef;
+						}
+					}
+				}
+			}
 		}
 	} else {
-		for (i = 0, j = 0; i < DriveLayout->PartitionCount; i++) {
+		for (i = 0; i < (int)DriveLayout->PartitionCount; i++) {
 			if (DriveLayout->PartitionEntry[i].StartingOffset.QuadPart == PartitionOffset) {
-				DriveLayout->PartitionEntry[i].Gpt.PartitionType = PARTITION_GENERIC_ESP;
+				esp_index = i;
+				if (DriveLayout->PartitionStyle == PARTITION_STYLE_GPT)
+					DriveLayout->PartitionEntry[esp_index].Gpt.PartitionType = PARTITION_GENERIC_ESP;
+				else if (DriveLayout->PartitionStyle == PARTITION_STYLE_MBR)
+					DriveLayout->PartitionEntry[esp_index].Mbr.PartitionType = 0xef;
 				break;
 			}
 		}
 	}
-	if (i >= DriveLayout->PartitionCount) {
+	if (esp_index < 0) {
 		uprintf("No partition to toggle");
 		goto out;
 	}
 
-	DriveLayout->PartitionEntry[i].RewritePartition = TRUE;	// Just in case
-	r = DeviceIoControl(hPhysical, IOCTL_DISK_SET_DRIVE_LAYOUT_EX, (BYTE*)DriveLayout, size, NULL, 0, &size, NULL);
+	DriveLayout->PartitionEntry[esp_index].RewritePartition = TRUE;	// Just in case
+	r = DeviceIoControl(hPhysical, IOCTL_DISK_SET_DRIVE_LAYOUT_EX, (BYTE*)DriveLayout, dl_size, NULL, 0, &dl_size, NULL);
 	if (!r) {
 		uprintf("Could not set drive layout: %s", WindowsErrorString());
 		goto out;
 	}
 	RefreshDriveLayout(hPhysical);
 	if (PartitionOffset == 0) {
-		if (CompareGUID(&DriveLayout->PartitionEntry[i].Gpt.PartitionType, &PARTITION_GENERIC_ESP)) {
+		if (delete_data) {
 			// We successfully reverted ESP from Basic Data -> Delete stored ESP info
 			ClearEspInfo((uint8_t)j);
 		} else if (!IsDriveLetterInUse(*mount_point)) {
 			// We successfully switched ESP to Basic Data -> Try to mount it
-			volume_name = GetLogicalName(DriveIndex, DriveLayout->PartitionEntry[i].StartingOffset.QuadPart, TRUE, FALSE);
+			volume_name = GetLogicalName(DriveIndex, DriveLayout->PartitionEntry[esp_index].StartingOffset.QuadPart, TRUE, FALSE);
 			IGNORE_RETVAL(MountVolume(mount_point, volume_name));
 			free(volume_name);
 		}
@@ -1635,6 +1711,136 @@ BOOL ToggleEsp(DWORD DriveIndex, uint64_t PartitionOffset)
 
 out:
 	safe_closehandle(hPhysical);
+	return ret;
+}
+
+// This is a crude attempt at detecting file systems through their superblock magic.
+// Note that we only attempt to detect the file systems that Rufus can format as
+// well as a couple other maintsream ones.
+const char* GetFsName(HANDLE hPhysical, LARGE_INTEGER StartingOffset)
+{
+	typedef struct {
+		const char* name;
+		const uint8_t magic[8];
+	} win_fs_type;
+	const win_fs_type win_fs_types[] = {
+		{ "exFAT", { 'E', 'X', 'F', 'A', 'T', ' ', ' ', ' ' } },
+		{ "NTFS", { 'N', 'T', 'F', 'S', ' ', ' ', ' ', ' ' } },
+		{ "ReFS", { 'R', 'e', 'F', 'S', 0, 0, 0, 0 } }
+	};
+	const win_fs_type fat_fs_types[] = {
+		{ "FAT", { 'F', 'A', 'T', ' ', ' ', ' ', ' ', ' ' } },
+		{ "FAT12", { 'F', 'A', 'T', '1', '2', ' ', ' ', ' ' } },
+		{ "FAT16", { 'F', 'A', 'T', '1', '6', ' ', ' ', ' ' } },
+		{ "FAT32", { 'F', 'A', 'T', '3', '2', ' ', ' ', ' ' } },
+	};
+	const uint32_t ext_feature[3][3] = {
+		// feature_compat
+		{ 0x0000017B, 0x00000004, 0x00000E00 },
+		// feature_ro_compat
+		{ 0x00000003, 0x00000000, 0x00008FF8 },
+		// feature_incompat
+		{ 0x00000013, 0x0000004C, 0x0003F780 }
+	};
+	const char* ext_names[] = { "ext", "ext2", "ext3", "ext4" };
+	const char* ret = "(Unrecognized)";
+	DWORD i, j, offset, size, sector_size = 512;
+	uint8_t* buf = calloc(sector_size, 1);
+	if (buf == NULL)
+		goto out;
+
+	// 1. Try to detect ISO9660/FAT/exFAT/NTFS/ReFS through the 512 bytes superblock at offset 0
+	if (!SetFilePointerEx(hPhysical, StartingOffset, NULL, FILE_BEGIN))
+		goto out;
+	if (!ReadFile(hPhysical, buf, sector_size, &size, NULL) || size != sector_size)
+		goto out;
+	if (strncmp("CD001", &buf[0x01], 5) == 0) {
+		ret = "ISO9660";
+		goto out;
+	}
+
+	// The beginning of a superblock for FAT/exFAT/NTFS/ReFS is pretty much always the same:
+	// There are 3 bytes potentially used for a jump instruction, and then are 8 bytes of
+	// OEM Name which, even if *not* technically correct, we are going to assume hold an
+	// immutable file system magic for exFAT/NTFS/ReFS (but not for FAT, see below).
+	for (i = 0; i < ARRAYSIZE(win_fs_types); i++)
+		if (memcmp(&buf[0x03], win_fs_types[i].magic, 8) == 0)
+			break;
+	if (i < ARRAYSIZE(win_fs_types)) {
+		ret = win_fs_types[i].name;
+		goto out;
+	}
+
+	// For FAT, because the OEM Name may actually be set to something else than what we
+	// expect, we poke the FAT12/16 Extended BIOS Parameter Block:
+	// https://en.wikipedia.org/wiki/Design_of_the_FAT_file_system#Extended_BIOS_Parameter_Block
+	// or FAT32 Extended BIOS Parameter Block:
+	// https://en.wikipedia.org/wiki/Design_of_the_FAT_file_system#FAT32_Extended_BIOS_Parameter_Block
+	for (offset = 0x36; offset <= 0x52; offset += 0x1C) {
+		for (i = 0; i < ARRAYSIZE(fat_fs_types); i++)
+			if (memcmp(&buf[offset], fat_fs_types[i].magic, 8) == 0)
+				break;
+		if (i < ARRAYSIZE(fat_fs_types)) {
+			ret = fat_fs_types[i].name;
+			goto out;
+		}
+	}
+
+	// 2. Try to detect Apple AFS/HFS/HFS+ through the 512 bytes superblock at either offset 0 or 1024
+	// "NXSB" at offset 0x20 => APFS
+	if (strncmp("NXSB", &buf[0x20], 4) == 0) {
+		ret = "APFS";
+		goto out;
+	}
+	// Switch to offset 1024
+	memset(buf, 0, sector_size);
+	StartingOffset.QuadPart += 0x0400ULL;
+	if (!SetFilePointerEx(hPhysical, StartingOffset, NULL, FILE_BEGIN))
+		goto out;
+	if (!ReadFile(hPhysical, buf, sector_size, &size, NULL) || size != sector_size)
+		goto out;
+	// "HX" or "H+" at offset 0x00 => HFS/HFS+
+	if (buf[0] == 'H' && (buf[1] == 'X' || buf[1] == '+')) {
+		ret = "HFS/HFS+";
+		goto out;
+	}
+
+	// 3. Try to detect ext2/ext3/ext4 through the 512 bytes superblock at offset 1024
+	// We're already at the right offset
+	if (!SetFilePointerEx(hPhysical, StartingOffset, NULL, FILE_BEGIN))
+		goto out;
+	if (!ReadFile(hPhysical, buf, sector_size, &size, NULL) || size != sector_size)
+		goto out;
+	if (buf[0x38] == 0x53 && buf[0x39] == 0xEF) {
+		uint32_t rev = 0;
+		for (i = 0; i < 3; i++) {
+			uint32_t feature = *((uint32_t*)&buf[0x5C + 4 * i]);
+			for (j = 0; j < 3; j++) {
+				if (feature & ext_feature[i][j] && rev <= j)
+					rev = j + 1;
+			}
+		}
+		assert(rev < ARRAYSIZE(ext_names));
+		ret = ext_names[rev];
+		goto out;
+	}
+
+	// 4. Try to detect UDF through by looking for a "BEA01\0" string at offset 0xC001
+	// NB: This is not thorough UDF detection but good enough for our purpose.
+	// For the full specs see: http://www.osta.org/specs/pdf/udf260.pdf
+	memset(buf, 0, sector_size);
+	StartingOffset.QuadPart += 0x8000ULL - 0x0400ULL;
+	if (!SetFilePointerEx(hPhysical, StartingOffset, NULL, FILE_BEGIN))
+		goto out;
+	if (!ReadFile(hPhysical, buf, sector_size, &size, NULL) || size != sector_size)
+		goto out;
+	if (strncmp("BEA01", &buf[1], 5) == 0) {
+		ret = "UDF";
+		goto out;
+	}
+
+out:
+	free(buf);
 	return ret;
 }
 
@@ -1754,9 +1960,11 @@ BOOL GetDrivePartitionData(DWORD DriveIndex, char* FileSystemName, DWORD FileSys
 					SelectedDrive.PartitionOffset[i] = DriveLayout->PartitionEntry[i].StartingOffset.QuadPart;
 					SelectedDrive.PartitionSize[i] = DriveLayout->PartitionEntry[i].PartitionLength.QuadPart;
 				}
-				suprintf("  Type: %s (0x%02x)\r\n  Size: %s (%lld bytes)\r\n  Start Sector: %lld, Boot: %s",
+				suprintf("  Type: %s (0x%02x)\r\n  Detected File System: %s\r\n"
+					"  Size: %s (%lld bytes)\r\n  Start Sector: %lld, Boot: %s",
 					((part_type == 0x07 || super_floppy_disk) && (FileSystemName[0] != 0)) ?
 					FileSystemName : GetMBRPartitionType(part_type), super_floppy_disk ? 0: part_type,
+					GetFsName(hPhysical, DriveLayout->PartitionEntry[i].StartingOffset),
 					SizeToHumanReadable(DriveLayout->PartitionEntry[i].PartitionLength.QuadPart, TRUE, FALSE),
 					DriveLayout->PartitionEntry[i].PartitionLength.QuadPart,
 					DriveLayout->PartitionEntry[i].StartingOffset.QuadPart / SelectedDrive.SectorSize,
@@ -1789,6 +1997,7 @@ BOOL GetDrivePartitionData(DWORD DriveIndex, char* FileSystemName, DWORD FileSys
 				GetGPTPartitionType(&DriveLayout->PartitionEntry[i].Gpt.PartitionType));
 			if (DriveLayout->PartitionEntry[i].Gpt.Name[0] != 0)
 				suprintf("  Name: '%S'", DriveLayout->PartitionEntry[i].Gpt.Name);
+			suprintf("  Detected File System: %s", GetFsName(hPhysical, DriveLayout->PartitionEntry[i].StartingOffset));
 			suprintf("  ID: %s\r\n  Size: %s (%" PRIi64 " bytes)\r\n  Start Sector: %" PRIi64 ", Attributes: 0x%016" PRIX64,
 				GuidToString(&DriveLayout->PartitionEntry[i].Gpt.PartitionId),
 				SizeToHumanReadable(DriveLayout->PartitionEntry[i].PartitionLength.QuadPart, TRUE, FALSE),
@@ -2219,7 +2428,12 @@ BOOL CreatePartition(HANDLE hDrive, int partition_style, int file_system, BOOL m
 			return FALSE;
 		}
 	} else {
-		DriveLayoutEx.PartitionEntry[pn].Gpt.PartitionType = write_as_esp ? PARTITION_GENERIC_ESP : PARTITION_MICROSOFT_DATA;
+		if (write_as_esp)
+			DriveLayoutEx.PartitionEntry[pn].Gpt.PartitionType = PARTITION_GENERIC_ESP;
+		else if (IS_EXT(file_system))
+			DriveLayoutEx.PartitionEntry[pn].Gpt.PartitionType = PARTITION_LINUX_DATA;
+		else
+			DriveLayoutEx.PartitionEntry[pn].Gpt.PartitionType = PARTITION_MICROSOFT_DATA;
 		IGNORE_RETVAL(CoCreateGuid(&DriveLayoutEx.PartitionEntry[pn].Gpt.PartitionId));
 		wcsncpy(DriveLayoutEx.PartitionEntry[pn].Gpt.Name, main_part_name, ARRAYSIZE(DriveLayoutEx.PartitionEntry[pn].Gpt.Name));
 	}
@@ -2245,9 +2459,14 @@ BOOL CreatePartition(HANDLE hDrive, int partition_style, int file_system, BOOL m
 			partition_offset[PI_ESP] = SelectedDrive.PartitionOffset[pn];
 
 		if (partition_style == PARTITION_STYLE_GPT) {
-			DriveLayoutEx.PartitionEntry[pn].Gpt.PartitionType = (extra_partitions & XP_ESP) ? PARTITION_GENERIC_ESP : PARTITION_MICROSOFT_DATA;
+			if (extra_partitions & XP_ESP)
+				DriveLayoutEx.PartitionEntry[pn].Gpt.PartitionType = PARTITION_GENERIC_ESP;
+			else if (extra_partitions & XP_CASPER)
+				DriveLayoutEx.PartitionEntry[pn].Gpt.PartitionType = PARTITION_LINUX_DATA;
+			else
+				DriveLayoutEx.PartitionEntry[pn].Gpt.PartitionType = PARTITION_MICROSOFT_DATA;
 			if (extra_partitions & XP_UEFI_NTFS) {
-				// Prevent a drive letter to be assigned to the UEFI:NTFS partition
+				// Prevent a drive letter from being assigned to the UEFI:NTFS partition
 				DriveLayoutEx.PartitionEntry[pn].Gpt.Attributes = GPT_BASIC_DATA_ATTRIBUTE_NO_DRIVE_LETTER;
 #if !defined(_DEBUG)
 				// Also make the partition read-only for release versions
